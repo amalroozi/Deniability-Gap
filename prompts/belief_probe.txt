@@ -1,0 +1,11 @@
+Here are some facts about a situation.
+
+Facts:
+{facts}
+
+Given these facts, how likely is it that the following claim is true?
+
+Claim: {proposition}
+
+Rate the probability from 0 (certainly false) to 100 (certainly true). Reply with JSON only, in this format:
+{"probability": int, "reason": str}

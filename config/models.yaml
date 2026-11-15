@@ -1,0 +1,49 @@
+# Models for the Deniability Gap pipeline (free tiers of Groq and Gemini).
+# `name` is the short label used in result files and plots.
+# Optional per-model fields:
+#   rpm, rpd, tpd     free-tier requests per minute, requests per day and
+#                     tokens per day; calls are paced to rpm, and a stage
+#                     stops before passing 90% of rpd or tpd. Empty = unknown.
+#   max_tokens        output cap for this model, replacing the per-kind default
+#                     (gemma reasons before answering and needs the room).
+#   reasoning_effort  passed to models that reason (lowest each one accepts).
+
+targets:
+  - name: gemini-flash-lite
+    model: gemini/gemini-3.5-flash-lite
+    rpm: 15
+    rpd: 500
+    tpd:
+  - name: gpt-oss-120b
+    model: groq/openai/gpt-oss-120b
+    reasoning_effort: low
+    rpm: 30
+    rpd: 1000
+    tpd: 200000
+  - name: qwen
+    model: groq/qwen/qwen3.8-27b
+    reasoning_effort: none
+    rpm: 30
+    rpd: 1000
+    tpd: 200000
+
+readers:
+  - name: gpt-oss-20b
+    model: groq/openai/gpt-oss-20b
+    reasoning_effort: low
+    rpm: 30
+    rpd: 1000
+    tpd: 200000
+  - name: gemma
+    model: gemini/gemma-4-31b-it
+    max_tokens: 1500
+    rpm: 30
+    rpd: 14400
+    tpd:
+
+judges:
+  - name: judge-flash-lite
+    model: gemini/gemini-3.1-flash-lite
+    rpm: 15
+    rpd: 500
+    tpd:

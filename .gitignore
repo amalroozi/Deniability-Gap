@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+cache/
+.DS_Store
+
+#Claude files
+.claude/
+CLAUDE.md
+
+# Mock outputs (regenerate with DGAP_MOCK=1)
+results/raw/runs/mockpilot/
+results/tables/*_MOCK_*

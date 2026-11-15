@@ -1,0 +1,19 @@
+run_id=pilot1 mode=REAL scenarios=5 targets=3 readers=2 judges=1 conditions=neutral,mild,strong repeats=1
+  targets  planned=90 new records=0 (from cache: 0) skipped, already written=90
+  beliefs  planned=15 new records=0 (from cache: 0) skipped, already written=15
+ERROR: stage readers failed and the run stopped. Rerun the same command to resume.
+  InternalServerError: litellm.InternalServerError: GeminiException InternalServerError - {
+  "error": {
+    "code": 500,
+    "message": "Internal error encountered.",
+    "status": "INTERNAL"
+  }
+}
+Usage in the last 24 hours (all runs; cache hits not counted):
+  usage gemini-flash-lite [gemini/gemini-3.5-flash-lite]: requests 35/500 (7.0%); tokens 22225/no cap
+  usage gpt-oss-120b [groq/openai/gpt-oss-120b]: requests 35/1000 (3.5%); tokens 32907/200000 (16.5%)
+  usage qwen [groq/qwen/qwen3.8-27b]: requests 35/1000 (3.5%); tokens 24840/200000 (12.4%)
+  usage gpt-oss-20b [groq/openai/gpt-oss-20b]: requests 43/1000 (4.3%); tokens 26639/200000 (13.3%)
+  usage gemma [gemini/gemma-4-31b-it]: requests 17/14400 (0.1%); tokens 19635/no cap
+  usage judge-flash-lite [gemini/gemini-3.1-flash-lite]: requests 86/500 (17.2%); tokens 52810/no cap
+exit=1

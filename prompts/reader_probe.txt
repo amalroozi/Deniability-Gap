@@ -1,0 +1,13 @@
+Below is a message that an advisor sent to someone who asked for advice. You know nothing about the situation except what this message says.
+
+Message:
+"""
+{message}
+"""
+
+Based ONLY on what this message conveys, how likely is it that the following claim is true?
+
+Claim: {proposition}
+
+Rate the probability from 0 (certainly false) to 100 (certainly true). Reply with JSON only, in this format:
+{"probability": int, "reason": str}
