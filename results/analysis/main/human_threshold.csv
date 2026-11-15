@@ -1,0 +1,10 @@
+statistic,value
+n_items,20.0
+reader_mean_n_implied_ge_0.6,0.0
+reader_mean_n_deniable_mislead,0.0
+human_n_implied_ge_0.6,4.0
+human_n_deniable_mislead,4.0
+human_mean_implied,0.3625
+reader_mean_implied,0.09
+n_human_higher_than_reader,16.0
+n_human_lower_than_reader,4.0

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,8 +41,15 @@ OPTIONAL_FIELDS = (*INT_FIELDS, "reasoning_effort")
 
 # One entry per HTTP 429 seen in this process: {"model", "attempt", "wait"}.
 rate_limit_events: list[dict] = []
-# model string -> time.monotonic() of the last real call attempt.
+# model string -> time.monotonic() of the last real call attempt (or the slot
+# reserved for the next one). Shared by all threads.
 _last_call: dict[str, float] = {}
+# One pacing lock per model string, so threads calling the same model share a
+# single rate limiter and threads calling different models never wait on each other.
+_pace_locks: dict[str, threading.Lock] = {}
+_pace_locks_guard = threading.Lock()
+# Serialises cache file writes across threads.
+_cache_write_lock = threading.Lock()
 
 # Errors that a retry cannot fix (bad key, bad model name, bad request).
 _NON_RETRYABLE = (
@@ -255,16 +263,33 @@ def retry_after_seconds(exc: BaseException) -> float | None:
     return None
 
 
+def _pace_lock(model: str) -> threading.Lock:
+    with _pace_locks_guard:
+        lock = _pace_locks.get(model)
+        if lock is None:
+            lock = _pace_locks[model] = threading.Lock()
+        return lock
+
+
 def _pace(model: str, rpm: int | None) -> None:
-    """Sleep so that calls to `model` are never closer than 60 / rpm seconds."""
-    if rpm:
-        interval = 60.0 / rpm * PACING_MARGIN
-        last = _last_call.get(model)
-        if last is not None:
-            wait = last + interval - time.monotonic()
-            if wait > 0:
-                time.sleep(wait)
-    _last_call[model] = time.monotonic()
+    """Sleep so that calls to `model` are never closer than 60 / rpm seconds.
+
+    Thread-safe: under the model's lock each caller reserves the next free
+    slot (at least 60 / rpm after the previous one), then sleeps outside the
+    lock until its slot. With one thread this is the same as sleeping until
+    the interval has passed and then stamping the call time.
+    """
+    with _pace_lock(model):
+        now = time.monotonic()
+        slot = now
+        if rpm:
+            last = _last_call.get(model)
+            if last is not None:
+                slot = max(now, last + 60.0 / rpm * PACING_MARGIN)
+        _last_call[model] = slot
+    wait = slot - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
 
 
 def _call_with_retries(
@@ -393,10 +418,11 @@ def complete(
         "usage": usage,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    directory.mkdir(parents=True, exist_ok=True)
-    tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
-    tmp_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp_path, cache_path)
+    with _cache_write_lock:
+        directory.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, cache_path)
     return record
 
 

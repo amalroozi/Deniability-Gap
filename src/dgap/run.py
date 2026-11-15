@@ -162,6 +162,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--conditions", default=list(pipeline.CONDITIONS), type=_parse_conditions)
     parser.add_argument("--repeats", default=1, type=_positive_int, help="replicates per item")
     parser.add_argument("--limit", default=None, type=_positive_int, help="use only the first N scenarios")
+    parser.add_argument(
+        "--workers",
+        default=1,
+        type=_positive_int,
+        help="parallel calls in the readers and judges stages (default 1: one at a time)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print call counts and make no calls")
     return parser
 
@@ -223,11 +229,11 @@ def main(argv=None, *, config_path="config/models.yaml", results_dir="results") 
                 stats = pipeline.run_beliefs(args.run_id, scenarios, config["targets"], args.repeats, **paths)
             elif stage == "readers":
                 stats = pipeline.run_readers(
-                    args.run_id, scenarios, config["targets"], config["readers"], *grid, **paths
+                    args.run_id, scenarios, config["targets"], config["readers"], *grid, **paths, workers=args.workers
                 )
             elif stage == "judges":
                 stats = pipeline.run_judges(
-                    args.run_id, scenarios, config["targets"], config["judges"], *grid, **paths
+                    args.run_id, scenarios, config["targets"], config["judges"], *grid, **paths, workers=args.workers
                 )
             else:
                 summary_path, items_path, table_mock = write_tables(

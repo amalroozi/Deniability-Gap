@@ -8,6 +8,8 @@ so an interrupted run can be restarted with the same command.
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -181,14 +183,32 @@ def daily_usage(runs_dir: str | Path, *, mock: bool, now: datetime | None = None
 
 
 class Budget:
-    """Tracks each model's requests and tokens against 90% of rpd and tpd."""
+    """Tracks each model's requests and tokens against 90% of rpd and tpd.
+
+    Thread-safe. `check` reserves one request and the token estimate for the
+    call it lets through; `add` swaps that reservation for the real usage. So
+    calls in flight on other threads count against the cap, and parallel
+    calls can never pass it together.
+    """
 
     def __init__(self, runs_dir: str | Path, *, mock: bool):
         self.used = daily_usage(runs_dir, mock=mock)
+        self.reserved: dict[str, dict[str, int]] = {}
+        self._lock = threading.Lock()
 
-    def check(self, entry: dict, messages: list[dict], max_tokens: int | None) -> None:
-        """Raise BudgetExceeded if one more call would pass 90% of a cap."""
-        used = self.used.get(entry["model"], {"requests": 0, "tokens": 0})
+    def check(self, entry: dict, messages: list[dict], max_tokens: int | None) -> int:
+        """Raise BudgetExceeded if one more call would pass 90% of a cap.
+
+        Otherwise reserve the call and return its token estimate, to be
+        passed back to `add`.
+        """
+        with self._lock:
+            return self._check(entry, messages, max_tokens)
+
+    def _check(self, entry: dict, messages: list[dict], max_tokens: int | None) -> int:
+        done = self.used.get(entry["model"], {"requests": 0, "tokens": 0})
+        pending = self.reserved.get(entry["model"], {"requests": 0, "tokens": 0})
+        used = {name: done[name] + pending[name] for name in ("requests", "tokens")}
         rpd, tpd = entry.get("rpd"), entry.get("tpd")
         if rpd and used["requests"] + 1 > BUDGET_FRACTION * rpd:
             raise BudgetExceeded(
@@ -203,11 +223,21 @@ class Budget:
                 f"{used['tokens']} tokens in the last 24 hours, and a call of about {estimate} "
                 f"more would pass {BUDGET_FRACTION:.0%} of tpd={tpd}"
             )
+        pending = self.reserved.setdefault(entry["model"], {"requests": 0, "tokens": 0})
+        pending["requests"] += 1
+        pending["tokens"] += estimate
+        return estimate
 
-    def add(self, entry: dict, usage: dict | None) -> None:
-        used = self.used.setdefault(entry["model"], {"requests": 0, "tokens": 0})
-        used["requests"] += 1
-        used["tokens"] += usage_tokens(usage)
+    def add(self, entry: dict, usage: dict | None, reserved_tokens: int | None = None) -> None:
+        """Count a finished request, releasing its reservation if it had one."""
+        with self._lock:
+            if reserved_tokens is not None:
+                pending = self.reserved[entry["model"]]
+                pending["requests"] -= 1
+                pending["tokens"] -= reserved_tokens
+            used = self.used.setdefault(entry["model"], {"requests": 0, "tokens": 0})
+            used["requests"] += 1
+            used["tokens"] += usage_tokens(usage)
 
 
 class _StageFile:
@@ -219,6 +249,10 @@ class _StageFile:
     records are not treated as done: a resumed run calls them again, and the
     new record replaces the failed one in the file. Without it, the error
     stops the stage.
+
+    `call` is thread-safe: the model call runs unlocked, while the skip check,
+    the file write and the stats update happen under one lock, so records are
+    never duplicated or interleaved.
     """
 
     def __init__(
@@ -242,6 +276,8 @@ class _StageFile:
         self.failed = {record_key(r) for r in existing if r.get("failed")} - self.records.keys()
         self.budget = Budget(runs_dir, mock=self.mock)
         self.stats = {"written": 0, "skipped": 0, "cached": 0, "no_advice": 0, "stopped": None, "failed": 0}
+        self._lock = threading.Lock()
+        self._in_flight: set[tuple] = set()
 
     def call(
         self,
@@ -260,11 +296,27 @@ class _StageFile:
     ) -> dict:
         """Return the record for this call, making the call only if it is new."""
         key = (kind, scenario_id, target, condition, replicate, entry["name"])
-        if key in self.records:
-            self.stats["skipped"] += 1
-            return self.records[key]
+        with self._lock:
+            if key in self.records:
+                self.stats["skipped"] += 1
+                return self.records[key]
+            if key in self._in_flight:
+                raise RuntimeError(f"call {key} was submitted twice in one stage")
+            self._in_flight.add(key)
+        try:
+            return self._call(key, kind=kind, scenario_id=scenario_id, entry=entry, target=target,
+                              condition=condition, replicate=replicate, messages=messages,
+                              temperature=temperature, seed=seed, mock_kind=mock_kind, parser=parser)
+        finally:
+            with self._lock:
+                self._in_flight.discard(key)
+
+    def _call(self, key, *, kind, scenario_id, entry, target, condition, replicate, messages,
+              temperature, seed, mock_kind, parser) -> dict:
         # A model's own cap (config max_tokens) replaces the default for its kind.
         max_tokens = entry.get("max_tokens") or MAX_TOKENS[kind]
+        # Token estimate reserved in the budget, set once a request is let through.
+        reservation: list[int] = []
         error = None
         try:
             result = complete(
@@ -278,18 +330,21 @@ class _StageFile:
                 reasoning_effort=entry.get("reasoning_effort"),
                 rpm=entry.get("rpm"),
                 # Runs only when a request is about to be made, never on a cache hit.
-                before_call=lambda: self.budget.check(entry, messages, max_tokens),
+                before_call=lambda: reservation.append(self.budget.check(entry, messages, max_tokens)),
             )
         except BudgetExceeded:
             raise
         except Exception as exc:
+            if reservation:
+                # The request was made and failed: it still counts, as before.
+                self.budget.add(entry, {}, reservation.pop())
             if not self.tolerate_failures:
                 raise
             error = type(exc).__name__
             result = {"text": "", "usage": {}, "cached": False,
                       "timestamp": datetime.now(timezone.utc).isoformat()}
-        if not result["cached"]:
-            self.budget.add(entry, result["usage"])
+        if reservation:
+            self.budget.add(entry, result["usage"], reservation.pop())
         parsed = None if error else parser(result["text"])
         record = {
             "run_id": self.run_id,
@@ -318,24 +373,65 @@ class _StageFile:
         if error:
             record["failed"] = True
             record["error"] = error
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if key in self.failed:
-            # Replace the earlier failed record for this call.
-            kept = [r for r in read_jsonl(self.path) if record_key(r) != key]
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept), encoding="utf-8")
-            tmp.replace(self.path)
-            self.failed.discard(key)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        if error:
-            self.failed.add(key)
-            self.stats["failed"] += 1
-        else:
-            self.records[key] = record
-        self.stats["written"] += 1
-        self.stats["cached"] += int(result["cached"])
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if key in self.failed:
+                # Replace the earlier failed record for this call.
+                kept = [r for r in read_jsonl(self.path) if record_key(r) != key]
+                tmp = self.path.with_name(self.path.name + ".tmp")
+                tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept), encoding="utf-8")
+                tmp.replace(self.path)
+                self.failed.discard(key)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if error:
+                self.failed.add(key)
+                self.stats["failed"] += 1
+            else:
+                self.records[key] = record
+            self.stats["written"] += 1
+            self.stats["cached"] += int(result["cached"])
         return record
+
+
+def _run_calls(stage: _StageFile, calls, workers: int = 1) -> None:
+    """Make every call in `calls` (an iterable of `stage.call` keyword dicts).
+
+    With workers=1 the calls run one after another, in order. With more, up
+    to `workers` run at once on a thread pool; `calls` is consumed lazily, so
+    no more than `workers` calls are ever queued. If a call raises (a budget
+    stop, or an error the stage does not tolerate), no further calls are
+    started, the ones in flight finish and are written, and the first error
+    is raised (a budget stop first, so the stage reports it as a stop).
+    """
+    if workers <= 1:
+        for kwargs in calls:
+            stage.call(**kwargs)
+        return
+    errors: list[BaseException] = []
+
+    def collect(done):
+        for future in done:
+            exc = future.exception()
+            if exc is not None:
+                errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"dgap-{stage.stage}") as pool:
+        pending: set = set()
+        try:
+            for kwargs in calls:
+                if errors:
+                    break
+                pending.add(pool.submit(stage.call, **kwargs))
+                if len(pending) >= workers:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    collect(done)
+        finally:
+            done, _ = wait(pending)
+            collect(done)
+    if errors:
+        budget = [exc for exc in errors if isinstance(exc, BudgetExceeded)]
+        raise (budget or errors)[0]
 
 
 def _parse_advice(text: str) -> str | None:
@@ -451,19 +547,32 @@ def run_beliefs(
 
 
 def run_readers(
-    run_id, scenarios, targets, readers, conditions, repeats, *, runs_dir=DEFAULT_RUNS_DIR, cache_dir=DEFAULT_CACHE_DIR
+    run_id,
+    scenarios,
+    targets,
+    readers,
+    conditions,
+    repeats,
+    *,
+    runs_dir=DEFAULT_RUNS_DIR,
+    cache_dir=DEFAULT_CACHE_DIR,
+    workers=1,
 ) -> dict:
-    """Every reader rates every advice message, seeing only the message."""
+    """Every reader rates every advice message, seeing only the message.
+
+    `workers` > 1 runs up to that many reader calls at once.
+    """
     stage = _StageFile(runs_dir, run_id, "readers", cache_dir, tolerate_failures=True)
     target_records = _load_target_records(runs_dir, run_id)
-    try:
+
+    def calls():
         for scenario, target, condition, replicate in _items(scenarios, targets, conditions, repeats):
             advice = _advice_for(target_records, runs_dir, run_id, scenario, target, condition, replicate)
             if not advice["parse_ok"]:
                 stage.stats["no_advice"] += 1
                 continue
             for reader in readers:
-                stage.call(
+                yield dict(
                     kind="reader",
                     scenario_id=scenario.id,
                     entry=reader,
@@ -476,6 +585,9 @@ def run_readers(
                     mock_kind="probability",
                     parser=parse_probability,
                 )
+
+    try:
+        _run_calls(stage, calls(), workers)
     except BudgetExceeded as exc:
         # Everything written so far is kept; rerunning the command resumes here.
         stage.stats["stopped"] = str(exc)
@@ -483,12 +595,25 @@ def run_readers(
 
 
 def run_judges(
-    run_id, scenarios, targets, judges, conditions, repeats, *, runs_dir=DEFAULT_RUNS_DIR, cache_dir=DEFAULT_CACHE_DIR
+    run_id,
+    scenarios,
+    targets,
+    judges,
+    conditions,
+    repeats,
+    *,
+    runs_dir=DEFAULT_RUNS_DIR,
+    cache_dir=DEFAULT_CACHE_DIR,
+    workers=1,
 ) -> dict:
-    """One judge call per item, on its advice message and confirm reply together."""
+    """One judge call per item, on its advice message and confirm reply together.
+
+    `workers` > 1 runs up to that many judge calls at once.
+    """
     stage = _StageFile(runs_dir, run_id, "judges", cache_dir, tolerate_failures=True)
     target_records = _load_target_records(runs_dir, run_id)
-    try:
+
+    def calls():
         for scenario, target, condition, replicate in _items(scenarios, targets, conditions, repeats):
             advice = _advice_for(target_records, runs_dir, run_id, scenario, target, condition, replicate)
             if not advice["parse_ok"]:
@@ -503,7 +628,7 @@ def run_judges(
                     f"condition={condition} replicate={replicate}. Finish the targets stage first."
                 )
             for judge in judges:
-                stage.call(
+                yield dict(
                     kind="judge",
                     scenario_id=scenario.id,
                     entry=judge,
@@ -516,6 +641,9 @@ def run_judges(
                     mock_kind="judge",
                     parser=parse_judge,
                 )
+
+    try:
+        _run_calls(stage, calls(), workers)
     except BudgetExceeded as exc:
         # Everything written so far is kept; rerunning the command resumes here.
         stage.stats["stopped"] = str(exc)
