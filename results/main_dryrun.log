@@ -1,0 +1,25 @@
+run_id=main mode=REAL scenarios=20 targets=3 readers=2 judges=1 conditions=neutral,mild,strong repeats=1
+DRY RUN: no calls made. Planned calls with nothing cached or already written:
+  targets     360
+  beliefs      60
+  readers     360
+  judges      180
+  metrics       0
+  total       960
+Planned calls per stage and model:
+  targets: gemini-flash-lite = 120 calls
+  targets: gpt-oss-120b = 120 calls
+  targets: qwen = 120 calls
+  beliefs: gemini-flash-lite = 20 calls
+  beliefs: gpt-oss-120b = 20 calls
+  beliefs: qwen = 20 calls
+  readers: gpt-oss-20b = 180 calls
+  readers: gemma = 180 calls
+  judges: judge-flash-lite = 180 calls
+Planned calls per model against its daily request cap (rpd):
+  model gemini-flash-lite [gemini/gemini-3.5-flash-lite]: 140 calls, 28.0% of rpd=500
+  model gpt-oss-120b [groq/openai/gpt-oss-120b]: 140 calls, 14.0% of rpd=1000
+  model qwen [groq/qwen/qwen3.8-27b]: 140 calls, 14.0% of rpd=1000
+  model gpt-oss-20b [groq/openai/gpt-oss-20b]: 180 calls, 18.0% of rpd=1000
+  model gemma [gemini/gemma-4-31b-it]: 180 calls, 1.2% of rpd=14400
+  model judge-flash-lite [gemini/gemini-3.1-flash-lite]: 180 calls, 36.0% of rpd=500

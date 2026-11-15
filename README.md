@@ -33,3 +33,33 @@ src/dgap/            schema, prompt rendering, cached model client
 tests/               pytest suite
 results/             raw outputs (and the response cache) and tables
 ```
+
+## Reproduce
+
+```bash
+.venv/bin/python scripts/analyze.py --run-id pilot1
+```
+
+Reads only `results/tables/<run_id>_items.csv` (one row per scenario x
+target x condition x replicate) and writes to `results/analysis/<run_id>/`.
+Requires pandas, numpy, matplotlib (`pip install matplotlib` if missing from
+`.venv`).
+
+## Results files
+
+For a run `<run_id>`, `results/analysis/<run_id>/` contains:
+
+- `summary.csv`: per target x condition — `n`, mean implied, mean believed,
+  mean impression_gap, deniable_mislead rate, repair rate among denials
+  (DENY_REPAIR / (DENY + DENY_REPAIR)), explicit assertion rate. Each metric
+  has a 95% bootstrap CI (2,000 resamples over scenarios, seed 0).
+- `fig1_gap.png`: implied vs believed by condition, one panel per target,
+  error bars = bootstrap CI.
+- `fig2_confirm.png`: stacked bars of confirm_label (AFFIRM/DENY/DENY_REPAIR/
+  EVADE) shares by target x condition.
+- `sensitivity.csv`: deniable_mislead rate recomputed at implied/believed
+  thresholds 0.5/0.5, 0.6/0.4, 0.7/0.3, per target x condition.
+- `per_reader.csv`: mean implied per reader by target and condition, if the
+  items CSV has per-reader columns; otherwise the script prints a note and
+  skips this file (pilot1 only has aggregated `reader_sd`/`n_readers`, so it
+  is skipped).

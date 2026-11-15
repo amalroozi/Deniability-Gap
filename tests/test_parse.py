@@ -1,8 +1,7 @@
 import pytest
 
 from dgap.parse import (
-    parse_judge_advice,
-    parse_judge_confirm,
+    parse_judge,
     parse_json_object,
     parse_probability,
     parse_yes_no,
@@ -89,21 +88,37 @@ def test_parse_json_object_garbage(text):
     assert parse_json_object(text, ["a"]) is None
 
 
-def test_parse_judge_advice():
-    good = '{"states_p_explicitly": false, "contradicts_p_explicitly": true, "discloses_adverse_fact": true}'
-    assert parse_judge_advice(f"```json\n{good}\n```") == {
+def test_parse_judge():
+    good = (
+        '{"states_p_explicitly": false, "contradicts_p_explicitly": true, '
+        '"discloses_adverse_fact": true, "confirm_label": "DENY_REPAIR"}'
+    )
+    expected = {
         "states_p_explicitly": False,
         "contradicts_p_explicitly": True,
         "discloses_adverse_fact": True,
+        "confirm_label": "DENY_REPAIR",
     }
-    assert parse_judge_advice('{"states_p_explicitly": false, "contradicts_p_explicitly": true}') is None
-    assert parse_judge_advice(good.replace("false", '"no"')) is None
-    assert parse_judge_advice("garbage") is None
+    assert parse_judge(f"```json\n{good}\n```") == expected
+    assert parse_judge(f"Here you go: {good}") == expected
+    for label in ("AFFIRM", "DENY", "EVADE"):
+        assert parse_judge(good.replace("DENY_REPAIR", label))["confirm_label"] == label
+    # Extra keys are dropped.
+    assert parse_judge(good[:-1] + ', "note": "x"}') == expected
 
 
-def test_parse_judge_confirm():
-    assert parse_judge_confirm('{"label": "DENY_REPAIR"}') == "DENY_REPAIR"
-    assert parse_judge_confirm('Here you go: {"label": "EVADE"}') == "EVADE"
-    assert parse_judge_confirm('{"label": "MAYBE"}') is None
-    assert parse_judge_confirm('{"label": "deny"}') is None
-    assert parse_judge_confirm("DENY") is None
+@pytest.mark.parametrize(
+    "bad",
+    [
+        '{"states_p_explicitly": false, "contradicts_p_explicitly": true, "discloses_adverse_fact": true}',
+        '{"states_p_explicitly": "no", "contradicts_p_explicitly": true, "discloses_adverse_fact": true, "confirm_label": "DENY"}',
+        '{"states_p_explicitly": false, "contradicts_p_explicitly": 1, "discloses_adverse_fact": true, "confirm_label": "DENY"}',
+        '{"states_p_explicitly": false, "contradicts_p_explicitly": true, "discloses_adverse_fact": true, "confirm_label": "MAYBE"}',
+        '{"states_p_explicitly": false, "contradicts_p_explicitly": true, "discloses_adverse_fact": true, "confirm_label": "deny"}',
+        '{"states_p_explicitly": false, "contradicts_p_explicitly": true, "discloses_adverse_fact": true, "label": "DENY"}',
+        "DENY",
+        "garbage",
+    ],
+)
+def test_parse_judge_rejects(bad):
+    assert parse_judge(bad) is None

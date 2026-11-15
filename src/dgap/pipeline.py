@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dgap.models import complete, mock_enabled
-from dgap.parse import parse_judge_advice, parse_judge_confirm, parse_probability, parse_yes_no
+from dgap.parse import parse_judge, parse_probability, parse_yes_no
 from dgap.prompts import format_facts, render
 from dgap.schema import Scenario
 
@@ -33,8 +33,7 @@ MAX_TOKENS = {
     "confirm": 250,
     "belief": 300,
     "reader": 300,
-    "judge_advice": 300,
-    "judge_confirm": 300,
+    "judge": 300,
 }
 
 # A stage stops before a call that would take a model past this share of its
@@ -93,14 +92,9 @@ def build_reader_messages(message: str, proposition: str) -> list[dict]:
     ]
 
 
-def build_judge_advice_messages(message: str, proposition: str) -> list[dict]:
-    return [
-        {"role": "user", "content": render("judge_advice", message=message, proposition=proposition)}
-    ]
-
-
-def build_judge_confirm_messages(message: str, reply: str, proposition: str) -> list[dict]:
-    content = render("judge_confirm", message=message, reply=reply, proposition=proposition)
+def build_judge_messages(message: str, reply: str, proposition: str) -> list[dict]:
+    """One judge call per item: the advice message and the confirm reply."""
+    content = render("judge", message=message, reply=reply, proposition=proposition)
     return [{"role": "user", "content": content}]
 
 
@@ -217,23 +211,37 @@ class Budget:
 
 
 class _StageFile:
-    """One stage's JSONL file: what is already in it, and appends to it."""
+    """One stage's JSONL file: what is already in it, and appends to it.
 
-    def __init__(self, runs_dir: str | Path, run_id: str, stage: str, cache_dir: str | Path):
+    With `tolerate_failures`, a call that still raises after its retries
+    (other than a budget stop) is written as a record with "failed": true,
+    parse_ok false and the error type, and the stage carries on. Failed
+    records are not treated as done: a resumed run calls them again, and the
+    new record replaces the failed one in the file. Without it, the error
+    stops the stage.
+    """
+
+    def __init__(
+        self, runs_dir: str | Path, run_id: str, stage: str, cache_dir: str | Path, *, tolerate_failures: bool = False
+    ):
+        self.tolerate_failures = tolerate_failures
         self.run_id = run_id
         self.stage = stage
         self.cache_dir = cache_dir
         self.mock = mock_enabled()
         self.path = Path(runs_dir) / run_id / f"{stage}.jsonl"
-        self.records = {record_key(record): record for record in read_jsonl(self.path)}
-        if any(record["mock"] != self.mock for record in self.records.values()):
+        existing = read_jsonl(self.path)
+        if any(record["mock"] != self.mock for record in existing):
             raise RuntimeError(
                 f"{self.path} holds {'real' if self.mock else 'MOCK'} records but this is a "
                 f"{'MOCK' if self.mock else 'real'} run. Mock and real records must never share "
                 "a run; use a different --run-id."
             )
+        self.records = {record_key(r): r for r in existing if not r.get("failed")}
+        # Failed calls to retry; each is dropped from the file when its key is written again.
+        self.failed = {record_key(r) for r in existing if r.get("failed")} - self.records.keys()
         self.budget = Budget(runs_dir, mock=self.mock)
-        self.stats = {"written": 0, "skipped": 0, "cached": 0, "no_advice": 0, "stopped": None}
+        self.stats = {"written": 0, "skipped": 0, "cached": 0, "no_advice": 0, "stopped": None, "failed": 0}
 
     def call(
         self,
@@ -257,22 +265,32 @@ class _StageFile:
             return self.records[key]
         # A model's own cap (config max_tokens) replaces the default for its kind.
         max_tokens = entry.get("max_tokens") or MAX_TOKENS[kind]
-        result = complete(
-            entry["model"],
-            messages,
-            temperature=temperature,
-            seed=seed,
-            cache_dir=self.cache_dir,
-            mock_kind=mock_kind,
-            max_tokens=max_tokens,
-            reasoning_effort=entry.get("reasoning_effort"),
-            rpm=entry.get("rpm"),
-            # Runs only when a request is about to be made, never on a cache hit.
-            before_call=lambda: self.budget.check(entry, messages, max_tokens),
-        )
+        error = None
+        try:
+            result = complete(
+                entry["model"],
+                messages,
+                temperature=temperature,
+                seed=seed,
+                cache_dir=self.cache_dir,
+                mock_kind=mock_kind,
+                max_tokens=max_tokens,
+                reasoning_effort=entry.get("reasoning_effort"),
+                rpm=entry.get("rpm"),
+                # Runs only when a request is about to be made, never on a cache hit.
+                before_call=lambda: self.budget.check(entry, messages, max_tokens),
+            )
+        except BudgetExceeded:
+            raise
+        except Exception as exc:
+            if not self.tolerate_failures:
+                raise
+            error = type(exc).__name__
+            result = {"text": "", "usage": {}, "cached": False,
+                      "timestamp": datetime.now(timezone.utc).isoformat()}
         if not result["cached"]:
             self.budget.add(entry, result["usage"])
-        parsed = parser(result["text"])
+        parsed = None if error else parser(result["text"])
         record = {
             "run_id": self.run_id,
             "stage": self.stage,
@@ -297,10 +315,24 @@ class _StageFile:
             "mock": self.mock,
             "timestamp": result["timestamp"],
         }
+        if error:
+            record["failed"] = True
+            record["error"] = error
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if key in self.failed:
+            # Replace the earlier failed record for this call.
+            kept = [r for r in read_jsonl(self.path) if record_key(r) != key]
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept), encoding="utf-8")
+            tmp.replace(self.path)
+            self.failed.discard(key)
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self.records[key] = record
+        if error:
+            self.failed.add(key)
+            self.stats["failed"] += 1
+        else:
+            self.records[key] = record
         self.stats["written"] += 1
         self.stats["cached"] += int(result["cached"])
         return record
@@ -343,7 +375,7 @@ def planned_calls(
         "targets": 2 * items,
         "beliefs": n_scenarios * n_targets * repeats,
         "readers": items * n_readers,
-        "judges": 2 * items * n_judges,
+        "judges": items * n_judges,
     }
 
 
@@ -422,7 +454,7 @@ def run_readers(
     run_id, scenarios, targets, readers, conditions, repeats, *, runs_dir=DEFAULT_RUNS_DIR, cache_dir=DEFAULT_CACHE_DIR
 ) -> dict:
     """Every reader rates every advice message, seeing only the message."""
-    stage = _StageFile(runs_dir, run_id, "readers", cache_dir)
+    stage = _StageFile(runs_dir, run_id, "readers", cache_dir, tolerate_failures=True)
     target_records = _load_target_records(runs_dir, run_id)
     try:
         for scenario, target, condition, replicate in _items(scenarios, targets, conditions, repeats):
@@ -453,8 +485,8 @@ def run_readers(
 def run_judges(
     run_id, scenarios, targets, judges, conditions, repeats, *, runs_dir=DEFAULT_RUNS_DIR, cache_dir=DEFAULT_CACHE_DIR
 ) -> dict:
-    """judge_advice on every advice message, judge_confirm on every confirm reply."""
-    stage = _StageFile(runs_dir, run_id, "judges", cache_dir)
+    """One judge call per item, on its advice message and confirm reply together."""
+    stage = _StageFile(runs_dir, run_id, "judges", cache_dir, tolerate_failures=True)
     target_records = _load_target_records(runs_dir, run_id)
     try:
         for scenario, target, condition, replicate in _items(scenarios, targets, conditions, repeats):
@@ -471,29 +503,18 @@ def run_judges(
                     f"condition={condition} replicate={replicate}. Finish the targets stage first."
                 )
             for judge in judges:
-                common = dict(
+                stage.call(
+                    kind="judge",
                     scenario_id=scenario.id,
                     entry=judge,
                     target=target["name"],
                     condition=condition,
                     replicate=replicate,
+                    messages=build_judge_messages(advice["response"], confirm["response"], scenario.proposition),
                     temperature=JUDGE_TEMPERATURE,
                     seed=INSTRUMENT_SEED,
                     mock_kind="judge",
-                )
-                stage.call(
-                    kind="judge_advice",
-                    messages=build_judge_advice_messages(advice["response"], scenario.proposition),
-                    parser=parse_judge_advice,
-                    **common,
-                )
-                stage.call(
-                    kind="judge_confirm",
-                    messages=build_judge_confirm_messages(
-                        advice["response"], confirm["response"], scenario.proposition
-                    ),
-                    parser=parse_judge_confirm,
-                    **common,
+                    parser=parse_judge,
                 )
     except BudgetExceeded as exc:
         # Everything written so far is kept; rerunning the command resumes here.

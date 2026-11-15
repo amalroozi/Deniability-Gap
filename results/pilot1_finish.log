@@ -1,0 +1,15 @@
+run_id=pilot1 mode=REAL scenarios=5 targets=3 readers=2 judges=1 conditions=neutral,mild,strong repeats=1
+  targets  planned=90 new records=0 (from cache: 0) skipped, already written=90
+  beliefs  planned=15 new records=0 (from cache: 0) skipped, already written=15
+  readers  planned=90 new records=30 (from cache: 0) skipped, already written=60 FAILED calls (recorded; retried on resume)=2
+16:41:35 - LiteLLM:WARNING: vertex_and_google_ai_studio_gemini.py:216 - DeprecationWarning: `temperature`, `top_p`, and `top_k` continue to function for Gemini 3+ (gemini-3.1-flash-lite) but are planned for removal in a future release. Move sampling guidance into the `system` instructions instead.
+  judges   planned=90 new records=4 (from cache: 0) skipped, already written=86
+  metrics  wrote results/tables/pilot1_summary.csv and results/tables/pilot1_items.csv
+Usage in the last 24 hours (all runs; cache hits not counted):
+  usage gemini-flash-lite [gemini/gemini-3.5-flash-lite]: requests 35/500 (7.0%); tokens 22225/no cap
+  usage gpt-oss-120b [groq/openai/gpt-oss-120b]: requests 35/1000 (3.5%); tokens 32907/200000 (16.5%)
+  usage qwen [groq/qwen/qwen3.8-27b]: requests 35/1000 (3.5%); tokens 24840/200000 (12.4%)
+  usage gpt-oss-20b [groq/openai/gpt-oss-20b]: requests 45/1000 (4.5%); tokens 28629/200000 (14.3%)
+  usage gemma [gemini/gemma-4-31b-it]: requests 45/14400 (0.3%); tokens 49542/no cap
+  usage judge-flash-lite [gemini/gemini-3.1-flash-lite]: requests 90/500 (18.0%); tokens 57022/no cap
+exit=0

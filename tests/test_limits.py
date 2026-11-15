@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from dgap import models, pipeline, run
@@ -239,9 +240,9 @@ def test_run_reports_a_persistent_error_and_can_resume(clock, monkeypatch, tmp_p
         if state["fail"] and state["calls"] > 3:
             raise RateLimitError("limit hit for key sk-secret-value", headers={"retry-after": "9999"})
         text = messages[-1]["content"]
-        if "label" in text or "states_p_explicitly" in text:
+        if "confirm_label" in text:
             return json.dumps({"states_p_explicitly": False, "contradicts_p_explicitly": True,
-                               "discloses_adverse_fact": True, "label": "DENY"}), {}
+                               "discloses_adverse_fact": True, "confirm_label": "DENY"}), {}
         if "probability" in text:
             return '{"probability": 20, "reason": "x"}', {}
         return "NO. It is not.", {}
@@ -430,9 +431,9 @@ def test_complete_returns_and_caches_only_the_final_answer(clock, monkeypatch, t
 def test_reasoning_never_reaches_records_the_confirm_turn_readers_or_judges(clock, monkeypatch, tmp_path):
     def fake(model, messages, temperature, seed, **options):
         text = messages[-1]["content"]
-        if "label" in text or "states_p_explicitly" in text:
+        if "confirm_label" in text:
             answer = json.dumps({"states_p_explicitly": False, "contradicts_p_explicitly": False,
-                                 "discloses_adverse_fact": False, "label": "EVADE"})
+                                 "discloses_adverse_fact": False, "confirm_label": "EVADE"})
         elif "probability" in text:
             answer = '{"probability": 70, "reason": "x"}'
         else:
@@ -508,7 +509,7 @@ def test_every_record_carries_its_output_cap(mock_env, tmp_path):
             caps.setdefault(record["kind"], set()).add(record["max_tokens"])
             assert isinstance(record["usage"], dict)
     assert caps == {"advice": {1200}, "confirm": {250}, "belief": {300}, "reader": {300},
-                    "judge_advice": {300}, "judge_confirm": {300}}
+                    "judge": {300}}
 
 
 def test_cache_key_depends_on_cap_and_reasoning_effort(mock_env, tmp_path):
@@ -575,14 +576,14 @@ def test_dry_run_prints_planned_calls_per_model(tmp_path, mock_env, capsys):
     assert run.main(argv, config_path=config, results_dir=tmp_path / "results") == 0
     output = capsys.readouterr().out
     # 2 scenarios x 3 conditions: 12 target calls and 2 belief calls per target,
-    # 12 reader calls per reader, 24 judge calls per judge.
+    # 12 reader calls per reader, 12 judge calls per judge (one per item).
     for line in (
         "targets: t1 = 12 calls", "targets: t2 = 12 calls", "beliefs: t1 = 2 calls",
-        "readers: r1 = 12 calls", "judges: j1 = 24 calls",
+        "readers: r1 = 12 calls", "judges: j1 = 12 calls",
         "model t1 [groq/t1]: 14 calls, 1.4% of rpd=1000",
         "model t2 [gemini/t2]: 14 calls, 2.8% of rpd=500",
         "model r1 [groq/r1]: 12 calls, 0.1% of rpd=14400",
-        "model j1 [gemini/j1]: 24 calls, no rpd set",
+        "model j1 [gemini/j1]: 12 calls, no rpd set",
     ):
         assert line in output
     assert not (tmp_path / "results").exists()
@@ -608,3 +609,181 @@ def test_a_models_own_max_tokens_replaces_the_default_cap(mock_env, tmp_path):
     pipeline.run_readers("r", SCENARIOS[:1], target, readers, CONDITIONS, 1, **dirs)
     caps = {(r["model"], r["max_tokens"]) for r in read_jsonl(tmp_path / "runs" / "r" / "readers.jsonl")}
     assert caps == {("plain", 300), ("roomy", 1500)}
+
+
+# ------------------------------------------------- server errors (HTTP 5xx)
+
+
+class InternalServerError(Exception):
+    """Same class name and status as litellm's HTTP 500 error."""
+
+    status_code = 500
+
+
+def test_5xx_retries_eight_times_with_the_set_backoff_then_raises(clock, monkeypatch, tmp_path):
+    attempts = []
+
+    def down(model, messages, temperature, seed, **options):
+        attempts.append(1)
+        raise InternalServerError("Internal error encountered.")
+
+    stub(monkeypatch, down)
+    with pytest.raises(InternalServerError):
+        complete("gemini/m", MESSAGES, temperature=0.0, seed=0, cache_dir=tmp_path)
+    assert len(attempts) == 8
+    assert clock.sleeps == [5, 10, 20, 40, 60, 60, 60]
+    assert list(tmp_path.rglob("*.json")) == []
+
+
+def test_5xx_then_success(clock, monkeypatch, tmp_path):
+    outcomes = [InternalServerError("x")] * 5
+
+    def flaky(model, messages, temperature, seed, **options):
+        if outcomes:
+            raise outcomes.pop(0)
+        return "ok", {}
+
+    stub(monkeypatch, flaky)
+    assert complete("gemini/m", MESSAGES, temperature=0.0, seed=0, cache_dir=tmp_path)["text"] == "ok"
+    assert clock.sleeps == [5, 10, 20, 40, 60]
+
+
+@pytest.mark.parametrize("status, expected", [(500, True), (503, True), (599, True), (429, False), (400, False), (None, False)])
+def test_is_server_error(status, expected):
+    exc = Exception("x")
+    exc.status_code = status
+    assert models.is_server_error(exc) is expected
+
+
+def _fail_for(models_to_fail):
+    """A fake provider: fixed valid answers, and a 500 for chosen models."""
+
+    def fake(model, messages, temperature, seed, **options):
+        if model in models_to_fail:
+            raise InternalServerError("Internal error encountered.")
+        text = messages[-1]["content"]
+        if "confirm_label" in text:
+            return json.dumps({"states_p_explicitly": False, "contradicts_p_explicitly": True,
+                               "discloses_adverse_fact": True, "confirm_label": "DENY"}), {"total_tokens": 5}
+        if "probability" in text:
+            return '{"probability": 30, "reason": "x"}', {"total_tokens": 5}
+        return "NO. It is not.", {"total_tokens": 5}
+
+    return fake
+
+
+TOLERANT = dict(
+    targets=[{"name": "t", "model": "groq/t"}],
+    readers=[{"name": "good", "model": "groq/good"}, {"name": "bad", "model": "gemini/bad"}],
+    judges=[{"name": "j", "model": "gemini/j"}],
+)
+
+
+def _run_stages(dirs, scenarios=None):
+    scenarios = scenarios or SCENARIOS[:1]
+    out = {}
+    out["targets"] = pipeline.run_targets("r", scenarios, TOLERANT["targets"], CONDITIONS, 1, **dirs)
+    out["beliefs"] = pipeline.run_beliefs("r", scenarios, TOLERANT["targets"], 1, **dirs)
+    out["readers"] = pipeline.run_readers("r", scenarios, TOLERANT["targets"], TOLERANT["readers"], CONDITIONS, 1, **dirs)
+    out["judges"] = pipeline.run_judges("r", scenarios, TOLERANT["targets"], TOLERANT["judges"], CONDITIONS, 1, **dirs)
+    return out
+
+
+def test_failed_reader_call_is_recorded_and_the_stage_continues(clock, monkeypatch, tmp_path):
+    stub(monkeypatch, _fail_for({"gemini/bad"}))
+    dirs = {"runs_dir": tmp_path / "runs", "cache_dir": tmp_path / "cache"}
+    stats = _run_stages(dirs)
+    assert stats["readers"]["written"] == 6 and stats["readers"]["failed"] == 3
+    readers = read_jsonl(tmp_path / "runs" / "r" / "readers.jsonl")
+    failed = [r for r in readers if r.get("failed")]
+    assert len(failed) == 3 and {r["model"] for r in failed} == {"bad"}
+    for record in failed:
+        assert record["parse_ok"] is False and record["parsed"] is None
+        assert record["error"] == "InternalServerError" and record["response"] == ""
+    good = [r for r in readers if not r.get("failed")]
+    assert len(good) == 3 and all(r["parse_ok"] for r in good)
+    # Nothing from the failing model reached the cache.
+    cached = "".join(path.read_text() for path in (tmp_path / "cache").rglob("*.json"))
+    assert "gemini/bad" not in cached
+
+
+def test_failed_judge_call_is_recorded_and_the_stage_continues(clock, monkeypatch, tmp_path):
+    stub(monkeypatch, _fail_for({"gemini/j"}))
+    dirs = {"runs_dir": tmp_path / "runs", "cache_dir": tmp_path / "cache"}
+    stats = _run_stages(dirs)
+    assert stats["judges"]["written"] == 3 and stats["judges"]["failed"] == 3
+    assert all(r["failed"] for r in read_jsonl(tmp_path / "runs" / "r" / "judges.jsonl"))
+
+
+@pytest.mark.parametrize("stage", ["targets", "beliefs"])
+def test_targets_and_beliefs_stay_fatal(clock, monkeypatch, tmp_path, stage):
+    dirs = {"runs_dir": tmp_path / "runs", "cache_dir": tmp_path / "cache"}
+    if stage == "beliefs":
+        stub(monkeypatch, _fail_for(set()))
+        pipeline.run_targets("r", SCENARIOS[:1], TOLERANT["targets"], CONDITIONS, 1, **dirs)
+    stub(monkeypatch, _fail_for({"groq/t"}))
+    with pytest.raises(InternalServerError):
+        if stage == "targets":
+            pipeline.run_targets("r", SCENARIOS[:1], TOLERANT["targets"], CONDITIONS, 1, **dirs)
+        else:
+            pipeline.run_beliefs("r", SCENARIOS[:1], TOLERANT["targets"], 1, **dirs)
+    assert all(not r.get("failed") for r in read_jsonl(tmp_path / "runs" / "r" / f"{stage}.jsonl"))
+
+
+def test_resume_retries_failed_records_and_replaces_them(clock, monkeypatch, tmp_path):
+    dirs = {"runs_dir": tmp_path / "runs", "cache_dir": tmp_path / "cache"}
+    stub(monkeypatch, _fail_for({"gemini/bad"}))
+    _run_stages(dirs)
+    path = tmp_path / "runs" / "r" / "readers.jsonl"
+    good_before = [r for r in read_jsonl(path) if not r.get("failed")]
+    # Still failing: the failed records are retried and stay failed, with no duplicates.
+    stats = pipeline.run_readers("r", SCENARIOS[:1], TOLERANT["targets"], TOLERANT["readers"], CONDITIONS, 1, **dirs)
+    assert stats["skipped"] == 3 and stats["failed"] == 3
+    assert len(read_jsonl(path)) == 6
+    # Provider recovers: the failed records are replaced by real ones.
+    stub(monkeypatch, _fail_for(set()))
+    stats = pipeline.run_readers("r", SCENARIOS[:1], TOLERANT["targets"], TOLERANT["readers"], CONDITIONS, 1, **dirs)
+    assert stats["skipped"] == 3 and stats["written"] == 3 and stats["failed"] == 0
+    after = read_jsonl(path)
+    keys = [pipeline.record_key(r) for r in after]
+    assert len(keys) == len(set(keys)) == 6
+    assert not any(r.get("failed") for r in after) and all(r["parse_ok"] for r in after)
+    assert [r for r in after if r["model"] == "good"] == good_before
+    # And a further run has nothing left to do.
+    stats = pipeline.run_readers("r", SCENARIOS[:1], TOLERANT["targets"], TOLERANT["readers"], CONDITIONS, 1, **dirs)
+    assert stats["written"] == 0 and stats["skipped"] == 6
+
+
+def test_metrics_use_the_readers_that_succeeded_and_count_failures(clock, monkeypatch, tmp_path):
+    from dgap.metrics import build_item_table, summarise
+
+    stub(monkeypatch, _fail_for({"gemini/bad"}))
+    dirs = {"runs_dir": tmp_path / "runs", "cache_dir": tmp_path / "cache"}
+    _run_stages(dirs)
+    items = build_item_table(tmp_path / "runs" / "r")
+    assert (items["implied"] == 0.30).all()  # only the good reader's 30
+    assert (items["n_readers"] == 1).all() and (items["n_reader_failed"] == 1).all()
+    summary = summarise(items)
+    assert (summary["n_reader_failed"] == 1).all()
+    # The failed call counts toward the parse failure rate: 1 of 6 records per item
+    # (advice, confirm, belief, one judge call, two readers).
+    assert summary["parse_failure_rate"].round(4).eq(round(1 / 6, 4)).all()
+
+
+def test_run_reports_failed_calls_and_finishes(clock, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("GROQ_API_KEY", "x")
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)
+    stub(monkeypatch, _fail_for({"gemini/bad"}))
+    config = tmp_path / "models.yaml"
+    config.write_text(
+        "targets:\n  - {name: t, model: groq/t}\nreaders:\n  - {name: good, model: groq/good}\n"
+        "  - {name: bad, model: gemini/bad}\njudges:\n  - {name: j, model: gemini/j}\n",
+        encoding="utf-8",
+    )
+    argv = ["--scenarios", str(PILOT), "--run-id", "r", "--limit", "1"]
+    assert run.main(argv, config_path=config, results_dir=tmp_path / "results") == 0
+    output = capsys.readouterr().out
+    assert "FAILED calls (recorded; retried on resume)=3" in output
+    summary = pd.read_csv(tmp_path / "results" / "tables" / "r_summary.csv")
+    assert (summary["n_reader_failed"] == 1).all()

@@ -17,6 +17,12 @@ MODEL_GROUPS = ("targets", "readers", "judges")
 MAX_ATTEMPTS = 4
 BACKOFF_BASE_SECONDS = 1.0
 
+# Server errors (HTTP 5xx) get their own, longer retry schedule: the waits
+# before attempts 2 to 8.
+SERVER_ERROR_BACKOFF_SECONDS = (5, 10, 20, 40, 60, 60, 60)
+SERVER_ERROR_MAX_ATTEMPTS = len(SERVER_ERROR_BACKOFF_SECONDS) + 1
+_SERVER_ERROR_NAMES = ("InternalServerError", "ServiceUnavailableError", "BadGatewayError")
+
 # Rate limits (HTTP 429) are retried separately from other errors.
 RATE_LIMIT_MAX_ATTEMPTS = 6
 RATE_LIMIT_BACKOFF_BASE_SECONDS = 5.0
@@ -109,13 +115,13 @@ def _mock_text(key: str, mock_kind: str | None) -> str:
         return f"{'YES' if number % 2 == 0 else 'NO'}. MOCK CONFIRM {tag}."
     if mock_kind == "probability":
         return json.dumps({"probability": number % 101, "reason": f"MOCK REASON {tag}"})
-    # "judge": one object that satisfies both judge schemas.
+    # "judge": the merged judge schema.
     return json.dumps(
         {
             "states_p_explicitly": bool(number & 1),
             "contradicts_p_explicitly": bool(number & 2),
             "discloses_adverse_fact": bool(number & 4),
-            "label": _MOCK_LABELS[(number >> 3) % len(_MOCK_LABELS)],
+            "confirm_label": _MOCK_LABELS[(number >> 3) % len(_MOCK_LABELS)],
         }
     )
 
@@ -214,6 +220,14 @@ def is_rate_limit(exc: BaseException) -> bool:
     return type(exc).__name__ == "RateLimitError" or getattr(exc, "status_code", None) == 429
 
 
+def is_server_error(exc: BaseException) -> bool:
+    """True for an HTTP 5xx from the provider."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool) and 500 <= status <= 599:
+        return True
+    return type(exc).__name__ in _SERVER_ERROR_NAMES
+
+
 _DELAY_IN_MESSAGE = re.compile(
     r"(?:try again in|retry in|retryDelay\W{1,4})\s*(?:(\d+)m)?(\d+(?:\.\d+)?)s", re.IGNORECASE
 )
@@ -259,12 +273,14 @@ def _call_with_retries(
     """Call the provider, pacing every attempt and retrying failures.
 
     A 429 honours Retry-After when given, else backs off (capped at 60 s),
-    for up to RATE_LIMIT_MAX_ATTEMPTS attempts. Other retryable errors get up
-    to MAX_ATTEMPTS attempts. The last error is raised; nothing is returned
+    for up to RATE_LIMIT_MAX_ATTEMPTS attempts. A 5xx gets up to
+    SERVER_ERROR_MAX_ATTEMPTS attempts with the SERVER_ERROR_BACKOFF_SECONDS
+    waits. Other retryable errors get up to MAX_ATTEMPTS attempts. The last error is raised; nothing is returned
     (and so nothing is cached) for a failed call.
     """
     errors = 0
     rate_limited = 0
+    server_errors = 0
     while True:
         _pace(model, rpm)
         try:
@@ -286,6 +302,12 @@ def _call_with_retries(
                 elif wait > RETRY_AFTER_MAX_SECONDS:
                     raise
                 time.sleep(wait)
+                continue
+            if is_server_error(exc):
+                server_errors += 1
+                if server_errors >= SERVER_ERROR_MAX_ATTEMPTS:
+                    raise
+                time.sleep(SERVER_ERROR_BACKOFF_SECONDS[server_errors - 1])
                 continue
             errors += 1
             if type(exc).__name__ in _NON_RETRYABLE or errors >= MAX_ATTEMPTS:
@@ -316,8 +338,8 @@ def complete(
 
     `mock_kind` shapes the mock output for the role being played: "advice"
     (short prose), "confirm" (starts with YES or NO), "probability" (JSON
-    {"probability": int, "reason": str}) or "judge" (JSON carrying the keys
-    of both judge schemas). It has no effect on a real call.
+    {"probability": int, "reason": str}) or "judge" (JSON with the three
+    judge booleans and confirm_label). It has no effect on a real call.
 
     `max_tokens` caps the output and `reasoning_effort` is passed to models
     that reason; both are part of the cache key when set. `rpm` paces real

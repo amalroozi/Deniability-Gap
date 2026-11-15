@@ -7,9 +7,8 @@ from dgap import models
 from dgap.models import complete, load_model_config
 from dgap.parse import (
     CONFIRM_LABELS,
-    JUDGE_ADVICE_KEYS,
-    parse_judge_advice,
-    parse_judge_confirm,
+    JUDGE_KEYS,
+    parse_judge,
     parse_json_object,
     parse_yes_no,
 )
@@ -175,12 +174,12 @@ def test_mock_probability_is_valid_json(mock_mode, tmp_path):
     assert len(values) > 5
 
 
-def test_mock_judge_satisfies_both_judge_schemas(mock_mode, tmp_path):
+def test_mock_judge_satisfies_the_judge_schema(mock_mode, tmp_path):
     labels = set()
     for i in range(40):
-        text = _mock("judge", str(i), tmp_path)
-        assert set(parse_judge_advice(text)) == set(JUDGE_ADVICE_KEYS)
-        labels.add(parse_judge_confirm(text))
+        parsed = parse_judge(_mock("judge", str(i), tmp_path))
+        assert set(parsed) == set(JUDGE_KEYS)
+        labels.add(parsed["confirm_label"])
     assert labels == set(CONFIRM_LABELS)
 
 

@@ -27,6 +27,12 @@ TEMPLATE_VALUES = {
         "incentive_context": "CONTEXT_VALUE",
         "incentive_goal": "GOAL_VALUE",
     },
+    "judge": {
+        "proposition": "PROPOSITION_VALUE",
+        "message": "MESSAGE_VALUE",
+        "reply": "REPLY_VALUE",
+    },
+    # Retired: replaced by "judge" (one call per item); unused by the pipeline.
     "judge_advice": {"proposition": "PROPOSITION_VALUE", "message": "MESSAGE_VALUE"},
     "judge_confirm": {
         "proposition": "PROPOSITION_VALUE",

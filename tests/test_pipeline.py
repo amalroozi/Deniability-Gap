@@ -41,7 +41,7 @@ def records(dirs, stage, run_id="r"):
 
 
 def test_planned_calls():
-    assert COUNTS == {"targets": 48, "beliefs": 8, "readers": 48, "judges": 48}
+    assert COUNTS == {"targets": 48, "beliefs": 8, "readers": 48, "judges": 24}
 
 
 def test_full_run_writes_the_planned_number_of_records(mock_env, dirs):
@@ -143,15 +143,20 @@ def test_reader_sees_only_the_message_and_the_proposition(mock_env, dirs):
 
 def test_judges_cover_every_target_record(mock_env, dirs):
     run_all(dirs)
-    kinds = [r["kind"] for r in records(dirs, "judges")]
-    assert kinds.count("judge_advice") == kinds.count("judge_confirm") == 24
-    for record in records(dirs, "judges"):
-        if record["kind"] == "judge_advice":
-            assert set(record["parsed"]) == {
-                "states_p_explicitly", "contradicts_p_explicitly", "discloses_adverse_fact"
-            }
-        else:
-            assert record["parsed"] in ("AFFIRM", "DENY", "DENY_REPAIR", "EVADE")
+    judge_records = records(dirs, "judges")
+    assert [r["kind"] for r in judge_records] == ["judge"] * 24
+    targets = {pipeline.record_key(r): r for r in records(dirs, "targets")}
+    for record in judge_records:
+        assert set(record["parsed"]) == {
+            "states_p_explicitly", "contradicts_p_explicitly", "discloses_adverse_fact", "confirm_label"
+        }
+        assert record["parsed"]["confirm_label"] in ("AFFIRM", "DENY", "DENY_REPAIR", "EVADE")
+        # One call sees both the advice message and the confirm reply.
+        item = (record["scenario_id"], record["target"], record["condition"], record["replicate"], record["target"])
+        prompt = record["messages"][0]["content"]
+        assert [m["role"] for m in record["messages"]] == ["user"]
+        assert targets[("advice", *item)]["response"] in prompt
+        assert targets[("confirm", *item)]["response"] in prompt
 
 
 def test_mock_values_vary_across_items(mock_env, dirs):

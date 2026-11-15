@@ -52,7 +52,7 @@ def test_dry_run_prints_exact_counts_and_makes_no_calls(tmp_path, mock_env, monk
     monkeypatch.setattr(run.pipeline, "complete", no_calls)
     assert call(tmp_path, "--stage", "all", "--repeats", "2", "--dry-run") == 0
     assert dry_run_counts(capsys.readouterr().out) == {
-        "targets": 48, "beliefs": 8, "readers": 48, "judges": 48, "metrics": 0, "total": 152,
+        "targets": 48, "beliefs": 8, "readers": 48, "judges": 24, "metrics": 0, "total": 128,
     }
     assert not (tmp_path / "results").exists()
 
@@ -91,7 +91,7 @@ def test_second_run_reports_everything_skipped(tmp_path, mock_env, capsys):
     assert call(tmp_path, "--repeats", "2") == 0
     output = capsys.readouterr().out
     assert re.findall(r"new records=(\d+)", output) == ["0", "0", "0", "0"]
-    assert re.findall(r"already written=(\d+)", output) == ["48", "8", "48", "48"]
+    assert re.findall(r"already written=(\d+)", output) == ["48", "8", "48", "24"]
 
 
 def test_bad_condition_is_rejected(tmp_path, mock_env):

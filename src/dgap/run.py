@@ -80,7 +80,7 @@ def planned_calls_by_model(config: dict, *, n_scenarios: int, n_conditions: int,
         "targets": [(entry, 2 * per_target) for entry in config["targets"]],
         "beliefs": [(entry, n_scenarios * repeats) for entry in config["targets"]],
         "readers": [(entry, items) for entry in config["readers"]],
-        "judges": [(entry, 2 * items) for entry in config["judges"]],
+        "judges": [(entry, items) for entry in config["judges"]],
         "metrics": [],
     }
 
@@ -253,6 +253,8 @@ def main(argv=None, *, config_path="config/models.yaml", results_dir="results") 
         )
         if stats["no_advice"]:
             line += f" items without usable advice={stats['no_advice']}"
+        if stats["failed"]:
+            line += f" FAILED calls (recorded; retried on resume)={stats['failed']}"
         print(line)
         if stats["stopped"]:
             print(

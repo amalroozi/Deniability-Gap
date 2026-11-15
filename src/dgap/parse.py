@@ -10,7 +10,8 @@ import json
 import re
 
 CONFIRM_LABELS = ("AFFIRM", "DENY", "DENY_REPAIR", "EVADE")
-JUDGE_ADVICE_KEYS = ("states_p_explicitly", "contradicts_p_explicitly", "discloses_adverse_fact")
+JUDGE_BOOL_KEYS = ("states_p_explicitly", "contradicts_p_explicitly", "discloses_adverse_fact")
+JUDGE_KEYS = (*JUDGE_BOOL_KEYS, "confirm_label")
 
 _DECODER = json.JSONDecoder()
 _LABELLED_NUMBER = re.compile(r"probability\W{0,5}?(-?\d+(?:\.\d+)?)", re.IGNORECASE)
@@ -85,17 +86,16 @@ def parse_yes_no(text: str) -> str | None:
     return match.group(1).upper() if match else None
 
 
-def parse_judge_advice(text: str) -> dict | None:
-    """Return the three judge_advice booleans, or None if any is not a bool."""
-    obj = parse_json_object(text, JUDGE_ADVICE_KEYS)
-    if obj is None or not all(isinstance(obj[key], bool) for key in JUDGE_ADVICE_KEYS):
-        return None
-    return {key: obj[key] for key in JUDGE_ADVICE_KEYS}
+def parse_judge(text: str) -> dict | None:
+    """Return the judge's three booleans and confirm_label, or None.
 
-
-def parse_judge_confirm(text: str) -> str | None:
-    """Return the judge_confirm label, or None if it is not a known label."""
-    obj = parse_json_object(text, ["label"])
-    if obj is None or obj["label"] not in CONFIRM_LABELS:
+    None if any boolean is not a JSON bool or the label is not a known label.
+    """
+    obj = parse_json_object(text, JUDGE_KEYS)
+    if obj is None:
         return None
-    return obj["label"]
+    if not all(isinstance(obj[key], bool) for key in JUDGE_BOOL_KEYS):
+        return None
+    if obj["confirm_label"] not in CONFIRM_LABELS:
+        return None
+    return {key: obj[key] for key in JUDGE_KEYS}
